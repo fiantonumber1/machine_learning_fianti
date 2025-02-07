@@ -88,13 +88,21 @@ def predict():
         svm_prediction = svm_model.predict(features)[0]
         nb_prediction = nb_model.predict(features)[0]
 
+        # Diagnosa kanker hanya jika **keduanya** memprediksi "Cancer" (1)
+        if svm_prediction == 1 and nb_prediction == 1:
+            diagnosis = "Cancer"
+        else:
+            diagnosis = "Non-Cancer"
+
         result = {
             "SVM_Prediction": "Cancer" if svm_prediction == 1 else "Non-Cancer",
             "Naive_Bayes_Prediction": "Cancer" if nb_prediction == 1 else "Non-Cancer",
+            "Final_Diagnosis": diagnosis
         }
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/train", methods=["POST"])
