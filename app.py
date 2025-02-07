@@ -96,7 +96,7 @@ def predict():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/train", methods=["POST"])
+
 @app.route("/train", methods=["POST"])
 def train():
     """Endpoint untuk melatih model"""
