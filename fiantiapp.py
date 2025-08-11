@@ -1,80 +1,142 @@
 import os
-import cv2
-import numpy as np
-import joblib
 from flask import Flask, request, jsonify
-from skimage.feature import hog
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
-from sklearn.naive_bayes import GaussianNB
 from werkzeug.utils import secure_filename
+from tensorflow import keras
+import keras_tuner as kt
 
-# Inisialisasi Flask
+# ======== Konfigurasi ========
 app = Flask(__name__)
-
-# Konfigurasi upload folder
 UPLOAD_FOLDER = "uploads"
 MODEL_PATH = "models"
-DATASET_PATH = "dataset"  # Folder dataset lokal
-POS_PATH = os.path.join(DATASET_PATH, "Cancer")
-NEG_PATH = os.path.join(DATASET_PATH, "Noncancer")
+DATASET_PATH = "dataset"  # dataset/Cancer dan dataset/Noncancer
+TUNER_DIR = "tuner_results"
+PROJECT_NAME = "cnn_cancer"
 
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 if not os.path.exists(MODEL_PATH):
     os.makedirs(MODEL_PATH)
+if not os.path.exists(TUNER_DIR):
+    os.makedirs(TUNER_DIR)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+cnn_model_path = os.path.join(MODEL_PATH, "cnn_best_model.h5")
 
-# Load model dan scaler jika tersedia
-scaler_path = os.path.join(MODEL_PATH, "scaler.pkl")
-svm_model_path = os.path.join(MODEL_PATH, "svm_model.pkl")
-nb_model_path = os.path.join(MODEL_PATH, "nb_model.pkl")
-
-if os.path.exists(scaler_path):
-    scaler = joblib.load(scaler_path)
-if os.path.exists(svm_model_path):
-    svm_model = joblib.load(svm_model_path)
-if os.path.exists(nb_model_path):
-    nb_model = joblib.load(nb_model_path)
-
+# ======== Fungsi Preprocessing untuk Prediksi ========
 def preprocess_image(image_path):
-    """Memproses gambar sebelum prediksi."""
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Gambar tidak valid atau tidak bisa dibaca.")
-    
-    img = cv2.resize(img, (128, 128))
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    features = hog(gray, orientations=9, pixels_per_cell=(8, 8), 
-                   cells_per_block=(2, 2), block_norm='L2-Hys')
-    features = scaler.transform([features])
-    
-    return features
+    img = keras.preprocessing.image.load_img(image_path, target_size=(64, 64))
+    img_array = keras.preprocessing.image.img_to_array(img)
+    img_array = img_array.astype("float32") / 255.0
+    return img_array.reshape((1, 64, 64, 3))
 
-def load_images_from_folder(folder, label):
-    images, labels = [], []
-    for filename in os.listdir(folder):
-        img_path = os.path.join(folder, filename)
-        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        if img is not None:
-            img = cv2.resize(img, (128, 128))
-            images.append(img)
-            labels.append(label)
-    return images, labels
+# ======== Build Model CNN untuk Hyperparameter Tuning ========
+def build_model(hp):
+    model = keras.Sequential()
+    model.add(keras.layers.Input(shape=(64, 64, 3)))
 
+    # Blok Conv2D
+    for i in range(hp.Int("conv_blocks", 1, 2, default=1)):
+        model.add(keras.layers.Conv2D(
+            filters=hp.Choice(f"filters_{i}", [16, 32, 64]),
+            kernel_size=hp.Choice(f"kernel_size_{i}", [3]),
+            activation="relu",
+            padding="same"
+        ))
+        model.add(keras.layers.MaxPooling2D(pool_size=2))
+
+    model.add(keras.layers.Flatten())
+    model.add(keras.layers.Dense(
+        units=hp.Choice("dense_units", [32, 64]),
+        activation="relu"
+    ))
+    model.add(keras.layers.Dropout(rate=hp.Float("dropout", 0.2, 0.4, step=0.1)))
+    model.add(keras.layers.Dense(1, activation="sigmoid"))
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(
+            learning_rate=hp.Choice("learning_rate", [1e-3, 1e-4])
+        ),
+        loss="binary_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+# ======== Endpoint Home ========
 @app.route("/")
 def home():
-    return jsonify({"message": "Cancer Detection API is Running!"})
+    return jsonify({"message": "Cancer Detection CNN API is Running!"})
 
+# ======== Endpoint Train ========
+@app.route("/train", methods=["POST"])
+def train():
+    try:
+        # Data Augmentation + Load data tanpa semua ke RAM
+        datagen_train = keras.preprocessing.image.ImageDataGenerator(
+            rescale=1./255,
+            rotation_range=15,
+            width_shift_range=0.1,
+            height_shift_range=0.1,
+            zoom_range=0.1,
+            horizontal_flip=True,
+            validation_split=0.2
+        )
+
+        train_generator = datagen_train.flow_from_directory(
+            DATASET_PATH,
+            target_size=(64, 64),
+            batch_size=16,
+            class_mode="binary",
+            subset="training"
+        )
+
+        val_generator = datagen_train.flow_from_directory(
+            DATASET_PATH,
+            target_size=(64, 64),
+            batch_size=16,
+            class_mode="binary",
+            subset="validation"
+        )
+
+        # Hyperparameter tuning
+        tuner = kt.Hyperband(
+            build_model,
+            objective="val_accuracy",
+            max_epochs=10,
+            factor=3,
+            directory=TUNER_DIR,
+            project_name=PROJECT_NAME,
+            overwrite=False,
+            executions_per_trial=1
+        )
+
+        # Checkpoint supaya tidak mulai dari nol
+        checkpoint_cb = keras.callbacks.ModelCheckpoint(
+            cnn_model_path,
+            save_best_only=True,
+            monitor="val_accuracy",
+            mode="max"
+        )
+
+        tuner.search(
+            train_generator,
+            validation_data=val_generator,
+            epochs=10,
+            callbacks=[checkpoint_cb]
+        )
+
+        best_model = tuner.get_best_models(num_models=1)[0]
+        best_model.save(cnn_model_path)
+
+        return jsonify({"message": "Training CNN with hyperparameter tuning completed!"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ======== Endpoint Predict ========
 @app.route("/predict", methods=["POST"])
 def predict():
-    """API untuk memprediksi gambar kanker atau tidak."""
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
-    
+
     file = request.files["file"]
     if file.filename == "":
         return jsonify({"error": "No selected file"}), 400
@@ -84,83 +146,21 @@ def predict():
     file.save(file_path)
 
     try:
-        features = preprocess_image(file_path)
-        svm_prediction = svm_model.predict(features)[0]
-        nb_prediction = nb_model.predict(features)[0]
+        if not os.path.exists(cnn_model_path):
+            return jsonify({"error": "Model belum dilatih"}), 400
 
-        # Diagnosa kanker hanya jika **keduanya** memprediksi "Cancer" (1)
-        if svm_prediction == 1 and nb_prediction == 1:
-            diagnosis = "Cancer"
-        else:
-            diagnosis = "Non-Cancer"
+        model = keras.models.load_model(cnn_model_path)
+        img = preprocess_image(file_path)
+        pred = model.predict(img)[0][0]
 
-        result = {
-            "SVM_Prediction": "Cancer" if svm_prediction == 1 else "Non-Cancer",
-            "Naive_Bayes_Prediction": "Cancer" if nb_prediction == 1 else "Non-Cancer",
+        diagnosis = "Cancer" if pred >= 0.5 else "Non-Cancer"
+
+        return jsonify({
+            "Prediction_Score": float(pred),
             "Final_Diagnosis": diagnosis
-        }
-        return jsonify(result)
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-
-@app.route("/train", methods=["POST"])
-def train():
-    """Endpoint untuk melatih model"""
-    try:
-        # Load dataset
-        pos_path = r"datasets\cancer"
-        neg_path = r"datasets\noncancer"
-
-        def load_images_from_folder(folder, label):
-            images = []
-            labels = []
-            for filename in os.listdir(folder):
-                img_path = os.path.join(folder, filename)
-                img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-                if img is not None:
-                    img = cv2.resize(img, (128, 128))
-                    images.append(img)
-                    labels.append(label)
-            return images, labels
-
-        positive_images, positive_labels = load_images_from_folder(pos_path, label=1)
-        negative_images, negative_labels = load_images_from_folder(neg_path, label=0)
-
-        images = np.array(positive_images + negative_images)
-        labels = np.array(positive_labels + negative_labels)
-
-        # Ekstraksi fitur HOG
-        hog_features = [hog(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), orientations=9, pixels_per_cell=(8, 8), cells_per_block=(2, 2), block_norm='L2-Hys') for img in images]
-        hog_features = np.array(hog_features)
-
-        # Train-test split
-        X_train, X_test, y_train, y_test = train_test_split(hog_features, labels, test_size=0.2, random_state=42)
-
-        # Standardize
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
-
-        # Simpan scaler
-        joblib.dump(scaler, os.path.join(MODEL_PATH, "scaler.pkl"))
-
-        # Train SVM
-        svm_model = SVC(kernel="linear", random_state=42)
-        svm_model.fit(X_train, y_train)
-        joblib.dump(svm_model, os.path.join(MODEL_PATH, "svm_model.pkl"))
-
-        # Train Naive Bayes
-        nb_model = GaussianNB()
-        nb_model.fit(X_train, y_train)
-        joblib.dump(nb_model, os.path.join(MODEL_PATH, "nb_model.pkl"))
-
-        return jsonify({"message": "Training completed successfully!"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)

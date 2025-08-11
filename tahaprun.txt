@@ -1,0 +1,8 @@
+1. curl --max-time 0 -X POST http://192.168.8.132:5001/train
+"message": "Training CNN with hyperparameter tuning completed!"
+
+2. curl -X POST -F "file=@C:\Users\fiansyah\Downloads\cancer_test.jpeg" http://192.168.8.132:5001/predict
+hasil {
+  "Final_Diagnosis": "Cancer",
+  "Prediction_Score": 0.5003820657730103
+}
