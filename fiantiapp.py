@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 from tensorflow import keras
 import keras_tuner as kt
+from PIL import Image
 
 # ======== Konfigurasi ========
 app = Flask(__name__)
@@ -22,12 +23,34 @@ if not os.path.exists(TUNER_DIR):
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 cnn_model_path = os.path.join(MODEL_PATH, "cnn_best_model.h5")
 
+# ======== Fungsi Validasi Dataset ========
+def validate_and_clean_dataset(directory):
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif'}
+    for root, _, files in os.walk(directory):
+        for file in files:
+            file_path = os.path.join(root, file)
+            ext = os.path.splitext(file)[1].lower()
+            if ext not in valid_extensions:
+                print(f"Removing non-image file: {file_path}")
+                os.remove(file_path)
+                continue
+            try:
+                img = Image.open(file_path)
+                img.verify()  # Verify the image is valid
+                img.close()
+            except Exception as e:
+                print(f"Removing invalid image: {file_path} - {str(e)}")
+                os.remove(file_path)
+
 # ======== Fungsi Preprocessing untuk Prediksi ========
 def preprocess_image(image_path):
-    img = keras.preprocessing.image.load_img(image_path, target_size=(64, 64))
-    img_array = keras.preprocessing.image.img_to_array(img)
-    img_array = img_array.astype("float32") / 255.0
-    return img_array.reshape((1, 64, 64, 3))
+    try:
+        img = keras.preprocessing.image.load_img(image_path, target_size=(64, 64))
+        img_array = keras.preprocessing.image.img_to_array(img)
+        img_array = img_array.astype("float32") / 255.0
+        return img_array.reshape((1, 64, 64, 3))
+    except Exception as e:
+        raise Exception(f"Failed to preprocess image {image_path}: {str(e)}")
 
 # ======== Build Model CNN untuk Hyperparameter Tuning ========
 def build_model(hp):
@@ -70,7 +93,10 @@ def home():
 @app.route("/train", methods=["POST"])
 def train():
     try:
-        # Data Augmentation + Load data tanpa semua ke RAM
+        # Validate and clean dataset
+        validate_and_clean_dataset(DATASET_PATH)
+
+        # Data Augmentation + Load data
         datagen_train = keras.preprocessing.image.ImageDataGenerator(
             rescale=1./255,
             rotation_range=15,
@@ -84,18 +110,26 @@ def train():
         train_generator = datagen_train.flow_from_directory(
             DATASET_PATH,
             target_size=(64, 64),
-            batch_size=16,
+            batch_size=8,  # Reduced batch size
             class_mode="binary",
-            subset="training"
+            subset="training",
+            shuffle=True
         )
 
         val_generator = datagen_train.flow_from_directory(
             DATASET_PATH,
             target_size=(64, 64),
-            batch_size=16,
+            batch_size=8,  # Reduced batch size
             class_mode="binary",
-            subset="validation"
+            subset="validation",
+            shuffle=True
         )
+
+        # Verify that data is found
+        if train_generator.samples == 0:
+            return jsonify({"error": "No training images found in dataset"}), 400
+        if val_generator.samples == 0:
+            return jsonify({"error": "No validation images found in dataset"}), 400
 
         # Hyperparameter tuning
         tuner = kt.Hyperband(
@@ -109,7 +143,7 @@ def train():
             executions_per_trial=1
         )
 
-        # Checkpoint supaya tidak mulai dari nol
+        # Checkpoint
         checkpoint_cb = keras.callbacks.ModelCheckpoint(
             cnn_model_path,
             save_best_only=True,
@@ -161,6 +195,10 @@ def predict():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        # Clean up uploaded file
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
